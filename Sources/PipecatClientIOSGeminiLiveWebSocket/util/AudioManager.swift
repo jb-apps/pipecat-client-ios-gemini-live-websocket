@@ -1,9 +1,8 @@
 import AVFAudio
 
 protocol AudioManagerDelegate: AnyObject {
-    func audioManagerDidChangeAvailableDevices(
-        _ audioManager: AudioManager
-    )
+    func audioManagerDidChangeAvailableDevices(_ audioManager: AudioManager)
+    func audioManagerDidChangeAudioDevice(_ audioManager: AudioManager)
 }
 
 final class AudioManager {
@@ -14,25 +13,13 @@ final class AudioManager {
     internal var preferredAudioDevice: AudioDeviceType? = nil {
         didSet {
             if self.preferredAudioDevice != oldValue {
-                self.configureAudioSession()
+                self.configureAudioSessionIfNeeded()
             }
         }
     }
 
     /// the actual audio device in use.
-    internal var audioDevice: AudioDeviceType {
-        let defaultDevice: AudioDeviceType = Self.defaultDevice
-
-        guard let firstOutput = self.audioSession.currentRoute.outputs.first else {
-            return defaultDevice
-        }
-
-        guard let audioDevice = AudioDeviceType(sessionPort: firstOutput.portType) else {
-            return defaultDevice
-        }
-
-        return audioDevice
-    }
+    internal var audioDevice: AudioDeviceType?
     
     /// the user's preferred device, if it's available, or nil—signifying "current system default"—otherwise.
     /// this is the basis of the selectedMic() exposed to the user, matching the Daily transport's behavior.
@@ -112,16 +99,22 @@ final class AudioManager {
         self.overriddenCategory = self.audioSession.category
         self.overriddenCategoryOptions = self.audioSession.categoryOptions
         
-        // Note: the refresh does configureAudioSession(), so no need to do it explicitly
-        self.refreshAvailableDevicesAndReconfigureIfNeeded(
-            // initial state after startManaging() does not represent a "change", so don't fire callbacks
-            suppressDelegateCallbacks: true
-        )
+        // Set initial device state (audioDevice and availableDevices) and configure the audio
+        // session if needed.
+        // Note: initial state after startManaging() does not represent a "change", so don't fire
+        // callbacks
+        self.refreshAvailableDevices(suppressDelegateCallbacks: true)
+        self.configureAudioSessionIfNeeded(suppressDelegateCallbacks: true)
+        
+        // Start polling for changes to available devices
         self.availableDevicesPollTimer = Timer.scheduledTimer(
             withTimeInterval: 0.25,
             repeats: true
         ) { [weak self] _ in
-            self?.refreshAvailableDevicesAndReconfigureIfNeeded()
+            self?.refreshAvailableDevices()
+            // Note: Polling is only for detecting changes to available devices that *don't* affect
+            // the audio route, so we don't need to call configureAudioSessionIfNeeded() here. In
+            // fact, avoiding calling it avoids unnecessary repeated reconfigurations.
         }
     }
 
@@ -130,8 +123,12 @@ final class AudioManager {
 
         self.isManaging = false
         
+        // Stop polling for changes to available devices
         self.availableDevicesPollTimer?.invalidate()
+        
+        // Reset device state
         self.availableDevices = []
+        self.audioDevice = nil
 
         self.resetAudioSession()
     }
@@ -155,11 +152,12 @@ final class AudioManager {
     }
 
     @objc private func routeDidChange(_ notification: Notification) {
-        refreshAvailableDevicesAndReconfigureIfNeeded()
+        refreshAvailableDevices()
+        configureAudioSessionIfNeeded()
     }
 
     @objc private func mediaServicesWereReset(_ notification: Notification) {
-        self.configureAudioSession()
+        self.configureAudioSessionIfNeeded()
     }
 
     // MARK: - Configuration
@@ -177,15 +175,37 @@ final class AudioManager {
         }
     }
 
-    private func configureAudioSession() {
+    private func configureAudioSessionIfNeeded(suppressDelegateCallbacks: Bool = false) {
         // Do nothing if we still not in a call
         if !self.isManaging {
             return
         }
 
         do {
-            if self.preferredAudioDevice != self.audioDevice {
-                try self.apply(preferredAudioDevice: preferredAudioDevice)
+            // If the current audio device is not the one we want...
+            //
+            // Note: here we use self.getCurrentAudioDevice() and not self.audioDevice because
+            // we'll only update self.audioDevice (and fire the corresponding delegate callback)
+            // *after* applying our configuration. We don't want to broadcast brief transient
+            // periods of routing through a non-preferred device.
+            if self.getCurrentAudioDevice() != self.preferredAudioDevice {
+                // Special case: avoid trying to configure earpiece if wired is available. Will
+                // result in infinite reconfiguration since routeDidChange() will fire every time.
+                if self.preferredAudioDeviceIsAvailable(.wired) && self.preferredAudioDevice == .earpiece {
+                    return
+                }
+                
+                // Apply desired configuration
+                try self.applyConfiguration()
+                
+                // Check whether we've switched to a new audio device
+                let newAudioDevice = getCurrentAudioDevice()
+                if audioDevice != newAudioDevice {
+                    audioDevice = newAudioDevice
+                    if !suppressDelegateCallbacks {
+                        delegate?.audioManagerDidChangeAudioDevice(self)
+                    }
+                }
             }
         } catch {
             Logger.shared.error("Error configuring audio session")
@@ -214,7 +234,7 @@ final class AudioManager {
     }
 
     // swiftlint:disable:next function_body_length cyclomatic_complexity
-    internal func apply(preferredAudioDevice: AudioDeviceType?) throws {
+    internal func applyConfiguration() throws {
         let session = self.audioSession
 
         var sessionMode: AVAudioSession.Mode = .voiceChat
@@ -296,19 +316,33 @@ final class AudioManager {
     
     // MARK: - Available Devices
     
-    private func refreshAvailableDevicesAndReconfigureIfNeeded(suppressDelegateCallbacks: Bool = false) {
+    private func refreshAvailableDevices(suppressDelegateCallbacks: Bool = false) {
         if !isManaging {
             return
         }
+        
+        // Check for change in available devices
         let newAvailableDevices = getAvailableDevices()
         if availableDevices != newAvailableDevices {
             availableDevices = newAvailableDevices
-            configureAudioSession()
             if !suppressDelegateCallbacks {
-                // We're firing this delegate *after* we're configuring the audio session so that in the delegate we can already assume a new device is ready for use
                 delegate?.audioManagerDidChangeAvailableDevices(self)
             }
         }
+    }
+    
+    private func getCurrentAudioDevice() -> AudioDeviceType {
+        let defaultDevice: AudioDeviceType = Self.defaultDevice
+
+        guard let firstOutput = self.audioSession.currentRoute.outputs.first else {
+            return defaultDevice
+        }
+
+        guard let audioDevice = AudioDeviceType(sessionPort: firstOutput.portType) else {
+            return defaultDevice
+        }
+
+        return audioDevice
     }
     
     // Adapted from WebrtcDevicesManager in Daily

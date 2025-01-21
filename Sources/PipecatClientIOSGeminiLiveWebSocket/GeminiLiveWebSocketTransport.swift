@@ -34,9 +34,8 @@ public class GeminiLiveWebSocketTransport: Transport {
         // start managing audio device configuration
         audioManager.startManagingIfNecessary()
         
-        // report initial available & selected devices
-        self._selectedMic = self.selectedMic()
-        self._actualMicInUse = self.actualMicInUse()
+        // initialize devices state and report initial available & selected devices
+        self._selectedMic = self.getSelectedMic()
         self.delegate?.onAvailableMicsUpdated(mics: self.getAllMics());
         self.delegate?.onMicUpdated(mic: self._selectedMic)
         
@@ -58,7 +57,6 @@ public class GeminiLiveWebSocketTransport: Transport {
         // stop managing audio device configuration and reset mic bookkeeping
         audioManager.stopManaging()
         _selectedMic = nil
-        _actualMicInUse = nil
     }
     
     public func connect(authBundle: PipecatClientIOS.AuthBundle?) async throws {
@@ -121,11 +119,8 @@ public class GeminiLiveWebSocketTransport: Transport {
     public func updateMic(micId: PipecatClientIOS.MediaDeviceId) async throws {
         audioManager.preferredAudioDevice = .init(deviceID: micId.id)
         
-        // Handle possible change in what we should report as the selected mic
-        handlePossibleChangeOfSelectedMic()
-        
-        // Handle possible change in the actual mic in use
-        handlePossibleChangeOfActualMicInUse()
+        // Refresh what we should report as the selected mic
+        refreshSelectedMicIfNeeded()
     }
     
     public func updateCam(camId: PipecatClientIOS.MediaDeviceId) async throws {
@@ -133,13 +128,8 @@ public class GeminiLiveWebSocketTransport: Transport {
     }
     
     /// What we report as the selected mic.
-    /// It's a value derived from the preferredAudioDevice and the set of available devices, so it may change whenever either of those change.
     public func selectedMic() -> PipecatClientIOS.MediaDeviceInfo? {
-        audioManager.availableDevices.first { $0.deviceID == audioManager.preferredAudioDeviceIfAvailable?.deviceID }?.toRtvi()
-    }
-    
-    public func actualMicInUse() -> PipecatClientIOS.MediaDeviceInfo? {
-        audioManager.availableDevices.first { $0.deviceID == audioManager.audioDevice.deviceID }?.toRtvi()
+        _selectedMic
     }
     
     public func selectedCam() -> PipecatClientIOS.MediaDeviceInfo? {
@@ -267,7 +257,6 @@ public class GeminiLiveWebSocketTransport: Transport {
     )
     private var devicesInitialized: Bool = false
     private var _selectedMic: MediaDeviceInfo?
-    private var _actualMicInUse: MediaDeviceInfo?
     
     // audio tracks aren't directly useful to the user; they're just dummy values for API completeness
     private var localAudioTrackID: MediaTrackId?
@@ -314,36 +303,25 @@ public class GeminiLiveWebSocketTransport: Transport {
         Logger.shared.warn("\(operationName) not supported")
     }
     
-    /// Handle possible change in what we should report as the selected mic
-    private func handlePossibleChangeOfSelectedMic() {
-        let newSelectedMic = selectedMic()
+    /// Refresh what we should report as the selected mic.
+    private func refreshSelectedMicIfNeeded() {
+        let newSelectedMic = getSelectedMic()
         if newSelectedMic != _selectedMic {
             _selectedMic = newSelectedMic
             delegate?.onMicUpdated(mic: _selectedMic)
         }
     }
     
-    /// Handle possible change in the actual mic in use
-    private func handlePossibleChangeOfActualMicInUse() {
-        // Update selectedMic if needed
-        if self.selectedMic() != self._selectedMic {
-            self._selectedMic = self.selectedMic()
-            self.delegate?.onMicUpdated(mic: self._selectedMic)
+    private func adaptToDeviceChange() {
+        do {
+            try audioPlayer.adaptToDeviceChange()
+        } catch {
+            Logger.shared.error("Audio player failed to adapt to device change")
         }
-        
-        // Handle change to actual device used, if needed
-        if self.actualMicInUse() != self._actualMicInUse {
-            self._actualMicInUse = self.actualMicInUse()
-            do {
-                try audioPlayer.adaptToDeviceChange()
-            } catch {
-                Logger.shared.error("Audio player failed to adapt to device change")
-            }
-            do {
-                try audioRecorder.adaptToDeviceChange()
-            } catch {
-                Logger.shared.error("Audio recorder failed to adapt to device change")
-            }
+        do {
+            try audioRecorder.adaptToDeviceChange()
+        } catch {
+            Logger.shared.error("Audio recorder failed to adapt to device change")
         }
     }
     
@@ -356,6 +334,11 @@ public class GeminiLiveWebSocketTransport: Transport {
         localAudioTrackID = localAudio
         botAudioTrackID = botAudio
         delegate?.onTracksUpdated(tracks: tracks()!)
+    }
+    
+    /// Selected mic is a value derived from the preferredAudioDevice and the set of available devices, so it may change whenever either of those change.
+    private func getSelectedMic() -> PipecatClientIOS.MediaDeviceInfo? {
+        audioManager.availableDevices.first { $0.deviceID == audioManager.preferredAudioDeviceIfAvailable?.deviceID }?.toRtvi()
     }
 }
 
@@ -420,12 +403,13 @@ extension GeminiLiveWebSocketTransport: AudioRecorderDelegate {
 extension GeminiLiveWebSocketTransport: AudioManagerDelegate {
     func audioManagerDidChangeAvailableDevices(_ audioManager: AudioManager) {
         // Report available mics changed
-        delegate?.onAvailableMicsUpdated(mics: audioManager.availableDevices.map { $0.toRtvi() })
+        delegate?.onAvailableMicsUpdated(mics: getAllMics())
         
-        // Handle possible change in what we should report as the selected mic
-        handlePossibleChangeOfSelectedMic()
-        
-        // Handle possible change in the actual mic in use
-        handlePossibleChangeOfActualMicInUse()
+        // Refresh what we should report as the selected mic
+        refreshSelectedMicIfNeeded()
+    }
+    
+    func audioManagerDidChangeAudioDevice(_ audioManager: AudioManager) {
+        adaptToDeviceChange()
     }
 }
