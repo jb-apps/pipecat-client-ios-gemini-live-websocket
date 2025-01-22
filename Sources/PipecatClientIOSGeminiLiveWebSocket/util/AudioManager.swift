@@ -114,7 +114,7 @@ final class AudioManager {
             self?.refreshAvailableDevices()
             // Note: Polling is only for detecting changes to available devices that *don't* affect
             // the audio route, so we don't need to call configureAudioSessionIfNeeded() here. In
-            // fact, avoiding calling it avoids unnecessary repeated reconfigurations.
+            // fact, avoiding calling it avoids unnecessary repeated attempts at reconfiguration.
         }
     }
 
@@ -189,12 +189,6 @@ final class AudioManager {
             // *after* applying our configuration. We don't want to broadcast brief transient
             // periods of routing through a non-preferred device.
             if self.getCurrentAudioDevice() != self.preferredAudioDevice {
-                // Special case: avoid trying to configure earpiece if wired is available. Will
-                // result in infinite reconfiguration since routeDidChange() will fire every time.
-                if self.preferredAudioDeviceIsAvailable(.wired) && self.preferredAudioDevice == .earpiece {
-                    return
-                }
-                
                 // Apply desired configuration
                 try self.applyConfiguration()
                 
@@ -213,24 +207,30 @@ final class AudioManager {
     }
 
     private func preferredAudioDeviceIsAvailable(_ preferredAudioDevice: AudioDeviceType?) -> Bool {
-        var allowedPortTypes: [AVAudioSession.Port]
-
+        var targetPortTypes: [AVAudioSession.Port]
+        var invert = false // whether to check whether targetPortTypes are *not* available
+        
         switch preferredAudioDevice {
-        case .wired?:
-            allowedPortTypes = [.headphones, .headsetMic]
+        case .wired?, .earpiece?:
+            targetPortTypes = [.headphones, .headsetMic]
+            if case .earpiece = preferredAudioDevice {
+                // We treat earpiece as available whenever wired is *not* available
+                invert = true
+            }
         case .bluetooth?:
-            allowedPortTypes = [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE]
-        case .earpiece?, .speakerphone?:
+            targetPortTypes = [.bluetoothA2DP, .bluetoothHFP, .bluetoothLE]
+        case .speakerphone?:
             return true
         case nil:
             return false
         }
-
-        var hasPreferredDevice = false
+        
+        var hasTargetPortType = false
         if let availableInputs = self.audioSession.availableInputs {
-            hasPreferredDevice = availableInputs.contains { allowedPortTypes.contains($0.portType) }
+            hasTargetPortType = availableInputs.contains { targetPortTypes.contains($0.portType) }
         }
-        return hasPreferredDevice || self.audioSession.currentRoute.outputs.contains { allowedPortTypes.contains($0.portType) }
+        hasTargetPortType = hasTargetPortType || self.audioSession.currentRoute.outputs.contains { targetPortTypes.contains($0.portType) }
+        return invert ? !hasTargetPortType : hasTargetPortType
     }
 
     // swiftlint:disable:next function_body_length cyclomatic_complexity
