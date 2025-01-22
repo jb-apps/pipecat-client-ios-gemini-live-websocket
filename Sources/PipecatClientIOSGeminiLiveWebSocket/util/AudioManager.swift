@@ -108,7 +108,7 @@ final class AudioManager {
         
         // Start polling for changes to available devices
         self.availableDevicesPollTimer = Timer.scheduledTimer(
-            withTimeInterval: 0.25,
+            withTimeInterval: 1,
             repeats: true
         ) { [weak self] _ in
             self?.refreshAvailableDevices()
